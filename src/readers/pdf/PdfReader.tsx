@@ -331,21 +331,38 @@ export default function PdfReader({ book }: { book: BookRecord }) {
   async function persist(nextHighlights: Highlight[]) {
     const doc = pdfLibDocRef.current
     if (!doc) return
+
+    // Every highlight action is itself a click — a valid user gesture — so we
+    // get a chance to (re-)request write permission right here, rather than
+    // depending on the user having noticed and clicked a separate "Enable
+    // file saving" button first. Doing this before doc.save() keeps it as
+    // close to the originating click as possible, since some browsers only
+    // honor requestPermission() within a short window of active gesture.
+    let canWriteToFile = false
+    if (book.fileHandle) {
+      try {
+        let permission = await queryWritePermission(book.fileHandle)
+        if (permission !== 'granted') {
+          permission = await requestWritePermission(book.fileHandle)
+        }
+        canWriteToFile = permission === 'granted'
+        setFileSyncStatus(canWriteToFile ? 'granted' : 'needs-permission')
+      } catch (err) {
+        console.error('Could not get write permission for the original file', err)
+        setFileSyncStatus('error')
+      }
+    }
+
     const bytes = await doc.save()
     pdfBytesRef.current = bytes
     const blob = new Blob([bytes.slice()], { type: 'application/pdf' })
     await updateBookFile(book.id, blob, nextHighlights.length)
 
-    if (book.fileHandle) {
+    if (book.fileHandle && canWriteToFile) {
       try {
-        const permission = await queryWritePermission(book.fileHandle)
-        if (permission === 'granted') {
-          await writeBytesToHandle(book.fileHandle, bytes)
-          setFileSyncStatus('granted')
-        } else {
-          setFileSyncStatus('needs-permission')
-        }
-      } catch {
+        await writeBytesToHandle(book.fileHandle, bytes)
+      } catch (err) {
+        console.error('Failed to save highlight directly to the original file', err)
         setFileSyncStatus('error')
       }
     }
