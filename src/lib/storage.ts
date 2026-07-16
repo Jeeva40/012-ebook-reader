@@ -1,12 +1,11 @@
 import { openDB, type DBSchema, type IDBPDatabase } from 'idb'
 
-export type BookFormat = 'pdf' | 'epub' | 'mobi'
+export type BookFormat = 'pdf' | 'epub'
 
 export interface BookMetadata {
   id: string
   title: string
   format: BookFormat
-  originalFormat: BookFormat | null
   addedAt: number
   lastReadPosition: string | null
   progress: number | null
@@ -15,20 +14,23 @@ export interface BookMetadata {
 }
 
 export interface BookRecord extends BookMetadata {
+  /** Cached copy of the file's bytes, for fast reopening without needing to
+   * re-request the file handle. Kept in sync with the handle on every save,
+   * but the handle — not this blob — is the source of truth for the
+   * original file on disk. */
   file: Blob
-  /** Writable handle to the original file on disk, when granted via the File
-   * System Access API. Null if unsupported, declined, or converted (e.g.
-   * MOBI -> EPUB, where the handle would no longer point at the right format). */
-  fileHandle: FileSystemFileHandle | null
+  /** Writable handle to the original file on disk, obtained via the File
+   * System Access API picker at upload time. This is what highlight saves
+   * write to directly. */
+  fileHandle: FileSystemFileHandle
 }
 
 export interface NewBookInput {
   title: string
   format: BookFormat
-  originalFormat: BookFormat | null
   file: Blob
   cover: Blob | null
-  fileHandle?: FileSystemFileHandle | null
+  fileHandle: FileSystemFileHandle
 }
 
 interface EbookReaderDB extends DBSchema {
@@ -59,14 +61,13 @@ export async function addBook(input: NewBookInput): Promise<BookRecord> {
     id: crypto.randomUUID(),
     title: input.title,
     format: input.format,
-    originalFormat: input.originalFormat,
     addedAt: Date.now(),
     lastReadPosition: null,
     progress: null,
     highlightCount: 0,
     cover: input.cover,
     file: input.file,
-    fileHandle: input.fileHandle ?? null,
+    fileHandle: input.fileHandle,
   }
 
   const db = await getDB()

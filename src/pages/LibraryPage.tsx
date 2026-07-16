@@ -29,18 +29,14 @@ export default function LibraryPage() {
       const taskId = crypto.randomUUID()
       setUploads((prev) => [
         ...prev,
-        { id: taskId, fileName: file.name, stage: 'converting' },
+        { id: taskId, fileName: file.name, stage: 'extracting-cover' },
       ])
 
-      processUploadedFile(
-        file,
-        (stage) => {
-          setUploads((prev) =>
-            prev.map((t) => (t.id === taskId ? { ...t, stage } : t)),
-          )
-        },
-        handle,
-      )
+      processUploadedFile(file, handle, (stage) => {
+        setUploads((prev) =>
+          prev.map((t) => (t.id === taskId ? { ...t, stage } : t)),
+        )
+      })
         .then(() => {
           setUploads((prev) => prev.filter((t) => t.id !== taskId))
           refresh()
@@ -91,7 +87,7 @@ export default function LibraryPage() {
 
       {isEmpty ? (
         <p className="text-center text-sm text-gray-500">
-          No books yet. Upload a PDF, EPUB, or MOBI file to get started.
+          No books yet. Choose a PDF or EPUB file to get started.
         </p>
       ) : (
         <div className="grid grid-cols-2 gap-5 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">

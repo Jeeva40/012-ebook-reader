@@ -2,33 +2,35 @@ import { Link } from 'react-router-dom'
 import type { FileSyncStatus } from '../../lib/fileSystemAccess'
 import FileSyncBadge from '../shared/FileSyncBadge'
 
-interface ReaderToolbarProps {
+interface EpubReaderToolbarProps {
   title: string
-  currentPage: number
-  numPages: number
-  scale: number
+  chapterLabel: string
+  progressPercent: number | null
   visible: boolean
+  flow: 'paginated' | 'scrolled'
+  tocOpen: boolean
   highlightsPanelOpen: boolean
   fileSyncStatus: FileSyncStatus
-  onZoomIn: () => void
-  onZoomOut: () => void
+  onToggleFlow: () => void
+  onToggleToc: () => void
   onToggleHighlights: () => void
   onGrantFileAccess: () => void
 }
 
-export default function ReaderToolbar({
+export default function EpubReaderToolbar({
   title,
-  currentPage,
-  numPages,
-  scale,
+  chapterLabel,
+  progressPercent,
   visible,
+  flow,
+  tocOpen,
   highlightsPanelOpen,
   fileSyncStatus,
-  onZoomIn,
-  onZoomOut,
+  onToggleFlow,
+  onToggleToc,
   onToggleHighlights,
   onGrantFileAccess,
-}: ReaderToolbarProps) {
+}: EpubReaderToolbarProps) {
   return (
     <div
       className={`absolute inset-x-0 top-0 z-20 flex items-center gap-3 border-b border-gray-200 bg-white/90 px-3 py-2.5 backdrop-blur transition-transform duration-200 sm:px-4 ${
@@ -45,38 +47,57 @@ export default function ReaderToolbar({
         </svg>
       </Link>
 
+      <button
+        type="button"
+        onClick={onToggleToc}
+        aria-pressed={tocOpen}
+        aria-label="Toggle table of contents"
+        className={`shrink-0 rounded-full p-1.5 ${
+          tocOpen ? 'bg-gray-900 text-white' : 'text-gray-500 hover:bg-gray-100 hover:text-gray-900'
+        }`}
+      >
+        <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+          <path
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            d="M3.75 6.75h16.5M3.75 12h16.5M3.75 17.25h16.5"
+          />
+        </svg>
+      </button>
+
       <div className="min-w-0 flex-1">
         <p className="truncate text-sm font-medium text-gray-900">{title}</p>
-        <p className="text-xs text-gray-400">
-          {currentPage} / {numPages}
+        <p className="truncate text-xs text-gray-400">
+          {chapterLabel}
+          {progressPercent != null ? ` · ${progressPercent}%` : ''}
         </p>
       </div>
 
-      <div className="flex shrink-0 items-center gap-0.5 rounded-full bg-gray-100 px-1 py-1">
-        <button
-          type="button"
-          onClick={onZoomOut}
-          aria-label="Zoom out"
-          className="rounded-full p-1.5 text-gray-600 hover:bg-white"
-        >
+      <button
+        type="button"
+        onClick={onToggleFlow}
+        aria-label={flow === 'paginated' ? 'Switch to scrolled view' : 'Switch to paginated view'}
+        title={flow === 'paginated' ? 'Switch to scrolled view' : 'Switch to paginated view'}
+        className="shrink-0 rounded-full p-1.5 text-gray-500 hover:bg-gray-100 hover:text-gray-900"
+      >
+        {flow === 'paginated' ? (
           <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-            <path strokeLinecap="round" strokeLinejoin="round" d="M5 12h14" />
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              d="M3.75 4.5h6v15h-6a.75.75 0 0 1-.75-.75V5.25a.75.75 0 0 1 .75-.75Zm10.5 0h6a.75.75 0 0 1 .75.75v13.5a.75.75 0 0 1-.75.75h-6v-15Z"
+            />
           </svg>
-        </button>
-        <span className="w-10 text-center text-xs tabular-nums text-gray-500">
-          {Math.round(scale * 100)}%
-        </span>
-        <button
-          type="button"
-          onClick={onZoomIn}
-          aria-label="Zoom in"
-          className="rounded-full p-1.5 text-gray-600 hover:bg-white"
-        >
+        ) : (
           <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-            <path strokeLinecap="round" strokeLinejoin="round" d="M12 5v14M5 12h14" />
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              d="M3.75 6.75h16.5M3.75 12h16.5M3.75 17.25h10.5"
+            />
           </svg>
-        </button>
-      </div>
+        )}
+      </button>
 
       <FileSyncBadge status={fileSyncStatus} onGrantFileAccess={onGrantFileAccess} />
 

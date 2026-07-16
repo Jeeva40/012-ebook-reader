@@ -10,7 +10,9 @@ import {
   queryWritePermission,
   requestWritePermission,
   writeBytesToHandle,
+  type FileSyncStatus,
 } from '../../lib/fileSystemAccess'
+import type { HighlightColor } from '../../lib/highlightColors'
 import {
   addHighlightToDoc,
   findHighlightsOverlappingQuads,
@@ -18,17 +20,17 @@ import {
   recolorHighlightInDoc,
   removeHighlightFromDoc,
   type Highlight,
-  type HighlightColor,
   type Quad,
 } from '../../lib/pdfHighlights'
 import { updateBookFile, updateBookProgress, type BookRecord } from '../../lib/storage'
+import GrantAccessPrompt from '../shared/GrantAccessPrompt'
+import HighlightPopover from '../shared/HighlightPopover'
+import SelectionToolbar from '../shared/SelectionToolbar'
 import { clientRectToQuad } from './geometry'
-import HighlightPopover from './HighlightPopover'
 import HighlightsPanel from './HighlightsPanel'
 import PdfPage from './PdfPage'
 import { PDFJS_DOCUMENT_PARAMS } from './pdfjsSetup'
-import ReaderToolbar, { type FileSyncStatus } from './ReaderToolbar'
-import SelectionToolbar from './SelectionToolbar'
+import ReaderToolbar from './ReaderToolbar'
 
 const MIN_SCALE = 0.5
 const MAX_SCALE = 3
@@ -72,7 +74,6 @@ export default function PdfReader({ book }: { book: BookRecord }) {
   const [fileSyncStatus, setFileSyncStatus] = useState<FileSyncStatus>(null)
 
   const pdfLibDocRef = useRef<PDFDocument | null>(null)
-  const pdfBytesRef = useRef<Uint8Array | null>(null)
   const loadingTaskRef = useRef<PDFDocumentLoadingTask | null>(null)
   const viewportsRef = useRef<Map<number, PageViewport>>(new Map())
   const wrapperElsRef = useRef<Map<number, HTMLDivElement>>(new Map())
@@ -93,7 +94,6 @@ export default function PdfReader({ book }: { book: BookRecord }) {
         const pdfLibDoc = await PDFDocument.load(libBytes, { updateMetadata: false })
         if (cancelled) return
         pdfLibDocRef.current = pdfLibDoc
-        pdfBytesRef.current = libBytes
         setHighlights(readHighlightsFromDoc(pdfLibDoc))
 
         const jsBytes = new Uint8Array(await book.file.arrayBuffer())
@@ -128,10 +128,6 @@ export default function PdfReader({ book }: { book: BookRecord }) {
   useEffect(() => {
     let cancelled = false
     async function checkPermission() {
-      if (!book.fileHandle) {
-        setFileSyncStatus('unsupported')
-        return
-      }
       const state = await queryWritePermission(book.fileHandle)
       if (!cancelled) setFileSyncStatus(state === 'granted' ? 'granted' : 'needs-permission')
     }
@@ -142,7 +138,6 @@ export default function PdfReader({ book }: { book: BookRecord }) {
   }, [book.fileHandle])
 
   async function handleGrantFileAccess() {
-    if (!book.fileHandle) return
     try {
       const state = await requestWritePermission(book.fileHandle)
       setFileSyncStatus(state === 'granted' ? 'granted' : 'needs-permission')
@@ -328,43 +323,71 @@ export default function PdfReader({ book }: { book: BookRecord }) {
     }
   }, [])
 
-  async function persist(nextHighlights: Highlight[]) {
+  /**
+   * Queries (and if needed, requests) write permission for the original
+   * file. Browsers only honor requestPermission() within a short window of
+   * active user gesture, so this must run as the very first await in each
+   * click handler below, before any other async work.
+   *
+   * This only ever reports failure states ('needs-permission' / 'error').
+   * It must NOT set 'granted', because the badge renders 'granted' as "Saved
+   * to file" — and at this point nothing has been written yet, just
+   * confirmed writable. Claiming "saved" here is exactly the bug where the
+   * badge goes green before (or even without) an actual disk write.
+   */
+  async function ensureWritePermissionForGesture(): Promise<boolean> {
+    try {
+      let permission = await queryWritePermission(book.fileHandle)
+      if (permission !== 'granted') {
+        permission = await requestWritePermission(book.fileHandle)
+      }
+      const granted = permission === 'granted'
+      if (!granted) setFileSyncStatus('needs-permission')
+      return granted
+    } catch (err) {
+      console.error('Could not get write permission for the original file', err)
+      setFileSyncStatus('error')
+      return false
+    }
+  }
+
+  // Serializes writes to the original file: if two highlight actions fire in
+  // quick succession, a second createWritable() before the first one's
+  // close() has resolved can race against it, and whichever close() lands
+  // last silently wins — potentially with stale bytes. Chaining onto this
+  // queue guarantees each write's close() fully resolves before the next
+  // write starts.
+  const writeQueueRef = useRef<Promise<void>>(Promise.resolve())
+
+  async function persist(nextHighlights: Highlight[], canWriteToFile: boolean) {
     const doc = pdfLibDocRef.current
     if (!doc) return
 
-    // Every highlight action is itself a click — a valid user gesture — so we
-    // get a chance to (re-)request write permission right here, rather than
-    // depending on the user having noticed and clicked a separate "Enable
-    // file saving" button first. Doing this before doc.save() keeps it as
-    // close to the originating click as possible, since some browsers only
-    // honor requestPermission() within a short window of active gesture.
-    let canWriteToFile = false
-    if (book.fileHandle) {
-      try {
-        let permission = await queryWritePermission(book.fileHandle)
-        if (permission !== 'granted') {
-          permission = await requestWritePermission(book.fileHandle)
-        }
-        canWriteToFile = permission === 'granted'
-        setFileSyncStatus(canWriteToFile ? 'granted' : 'needs-permission')
-      } catch (err) {
-        console.error('Could not get write permission for the original file', err)
-        setFileSyncStatus('error')
-      }
-    }
-
     const bytes = await doc.save()
-    pdfBytesRef.current = bytes
     const blob = new Blob([bytes.slice()], { type: 'application/pdf' })
     await updateBookFile(book.id, blob, nextHighlights.length)
 
-    if (book.fileHandle && canWriteToFile) {
-      try {
-        await writeBytesToHandle(book.fileHandle, bytes)
-      } catch (err) {
-        console.error('Failed to save highlight directly to the original file', err)
-        setFileSyncStatus('error')
-      }
+    if (!canWriteToFile) return
+
+    const writeAttempt = writeQueueRef.current.then(() =>
+      writeBytesToHandle(book.fileHandle, bytes),
+    )
+    // Keep the queue alive even after a failed write, so the next highlight
+    // action still waits its turn instead of racing the failed one.
+    writeQueueRef.current = writeAttempt.then(
+      () => undefined,
+      () => undefined,
+    )
+
+    try {
+      await writeAttempt
+      // Only now — after close() has actually resolved — is the file on
+      // disk guaranteed to reflect these bytes, so only now is it correct
+      // to tell the user it's saved.
+      setFileSyncStatus('granted')
+    } catch (err) {
+      console.error('Failed to save highlight directly to the original file', err)
+      setFileSyncStatus('error')
     }
   }
 
@@ -375,6 +398,8 @@ export default function PdfReader({ book }: { book: BookRecord }) {
     window.getSelection()?.removeAllRanges()
     if (!info || !doc) return
 
+    const canWriteToFile = await ensureWritePermissionForGesture()
+
     if (color.isEraser) {
       // Erase any highlights under the selection; nothing to do if there aren't any.
       const toRemove = findHighlightsOverlappingQuads(highlights, info.pageIndex, info.quads)
@@ -383,7 +408,7 @@ export default function PdfReader({ book }: { book: BookRecord }) {
       const removedIds = new Set(toRemove.map((h) => h.id))
       const next = highlights.filter((h) => !removedIds.has(h.id))
       setHighlights(next)
-      await persist(next)
+      await persist(next, canWriteToFile)
       return
     }
 
@@ -391,7 +416,7 @@ export default function PdfReader({ book }: { book: BookRecord }) {
     if (!added) return
     const next = [...highlights, added]
     setHighlights(next)
-    await persist(next)
+    await persist(next, canWriteToFile)
   }
 
   async function handleDeleteHighlight() {
@@ -400,10 +425,12 @@ export default function PdfReader({ book }: { book: BookRecord }) {
     setActivePopover(null)
     if (!doc || !target) return
 
+    const canWriteToFile = await ensureWritePermissionForGesture()
+
     removeHighlightFromDoc(doc, target)
     const next = highlights.filter((h) => h.id !== target.id)
     setHighlights(next)
-    await persist(next)
+    await persist(next, canWriteToFile)
   }
 
   async function handleRecolorHighlight(color: HighlightColor) {
@@ -416,25 +443,13 @@ export default function PdfReader({ book }: { book: BookRecord }) {
     setActivePopover(null)
     if (!doc || !target) return
 
+    const canWriteToFile = await ensureWritePermissionForGesture()
+
     const updated = recolorHighlightInDoc(doc, target, color)
     const next = highlights.filter((h) => h.id !== target.id)
     if (updated) next.push(updated)
     setHighlights(next)
-    await persist(next)
-  }
-
-  function handleDownload() {
-    const bytes = pdfBytesRef.current
-    if (!bytes) return
-    const blob = new Blob([bytes.slice()], { type: 'application/pdf' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `${book.title}.pdf`
-    document.body.appendChild(a)
-    a.click()
-    a.remove()
-    URL.revokeObjectURL(url)
+    await persist(next, canWriteToFile)
   }
 
   function jumpToPage(pageIndex: number) {
@@ -482,7 +497,6 @@ export default function PdfReader({ book }: { book: BookRecord }) {
         onZoomIn={() => setScale((s) => Math.min(MAX_SCALE, +(s + ZOOM_STEP).toFixed(2)))}
         onZoomOut={() => setScale((s) => Math.max(MIN_SCALE, +(s - ZOOM_STEP).toFixed(2)))}
         onToggleHighlights={() => setHighlightsPanelOpen((v) => !v)}
-        onDownload={handleDownload}
         onGrantFileAccess={handleGrantFileAccess}
       />
 
@@ -508,7 +522,14 @@ export default function PdfReader({ book }: { book: BookRecord }) {
         ))}
       </div>
 
-      {selectionInfo && (
+      {selectionInfo && fileSyncStatus === 'needs-permission' && (
+        <GrantAccessPrompt
+          anchorRect={selectionInfo.anchorRect}
+          onGrant={handleGrantFileAccess}
+        />
+      )}
+
+      {selectionInfo && fileSyncStatus !== 'needs-permission' && (
         <SelectionToolbar anchorRect={selectionInfo.anchorRect} onPick={handlePickColor} />
       )}
 

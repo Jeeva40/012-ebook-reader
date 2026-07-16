@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react'
-import { HIGHLIGHT_COLORS, type HighlightColor } from '../../lib/pdfHighlights'
+import { HIGHLIGHT_COLORS, type HighlightColor } from '../../lib/highlightColors'
 
 interface HighlightPopoverProps {
   x: number

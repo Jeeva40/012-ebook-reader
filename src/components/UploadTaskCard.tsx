@@ -8,7 +8,6 @@ export interface UploadTask {
 }
 
 const STAGE_LABEL: Record<UploadStage, string> = {
-  converting: 'Converting via Calibre…',
   'extracting-cover': 'Extracting cover…',
   saving: 'Saving…',
 }

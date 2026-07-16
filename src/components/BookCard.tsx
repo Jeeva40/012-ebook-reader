@@ -52,11 +52,7 @@ export default function BookCard({ book, onDelete }: BookCardProps) {
           <p className="truncate text-sm font-medium text-gray-900">
             {book.title}
           </p>
-          {book.originalFormat ? (
-            <p className="mt-0.5 text-xs text-gray-400">
-              Converted from {book.originalFormat.toUpperCase()}
-            </p>
-          ) : book.progress != null ? (
+          {book.progress != null ? (
             <p className="mt-0.5 text-xs text-gray-400">
               {Math.round(book.progress * 100)}% read
             </p>
