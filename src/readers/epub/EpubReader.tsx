@@ -24,6 +24,7 @@ import {
 import { updateBookFile, updateBookProgress, type BookRecord } from '../../lib/storage'
 import GrantAccessPrompt from '../shared/GrantAccessPrompt'
 import HighlightPopover from '../shared/HighlightPopover'
+import SelectionOverlay, { type OverlayRect } from '../shared/SelectionOverlay'
 import SelectionToolbar from '../shared/SelectionToolbar'
 import EpubHighlightsPanel from './EpubHighlightsPanel'
 import EpubReaderToolbar from './EpubReaderToolbar'
@@ -47,6 +48,7 @@ interface SelectionInfo {
   anchorRect: DOMRect
   contentsDoc: Document
   rangeSnapshot: Range
+  overlayRects: OverlayRect[]
 }
 
 interface PopoverInfo {
@@ -117,6 +119,11 @@ export default function EpubReader({ book }: { book: BookRecord }) {
       p: { margin: '0 0 1em 0' },
     })
 
+    // epub.js's own Contents class already debounces this event on
+    // selectionchange (250ms, see onSelectionChange/triggerSelectedEvent in
+    // node_modules/epubjs/src/contents.js) and only fires it for a
+    // non-collapsed range, so no extra debounce is needed here — we can
+    // capture and clear the selection directly once it arrives.
     rendition.on('selected', (cfiRange: string, contents: Contents) => {
       const sel = contents.window.getSelection()
       if (!sel || sel.isCollapsed || sel.rangeCount === 0) return
@@ -136,6 +143,17 @@ export default function EpubReader({ book }: { book: BookRecord }) {
             rangeRect.height,
           )
         : rangeRect
+      // getClientRects() (plural) are in the *iframe's* own coordinate
+      // space, same as getBoundingClientRect() above, so they need the same
+      // iframeRect offset to be positioned correctly in the top-level page.
+      const overlayRects: OverlayRect[] = Array.from(range.getClientRects())
+        .filter((r) => r.width > 0.5 && r.height > 0.5)
+        .map((r) => ({
+          left: r.left + (iframeRect?.left ?? 0),
+          top: r.top + (iframeRect?.top ?? 0),
+          width: r.width,
+          height: r.height,
+        }))
 
       setActivePopover(null)
       setSelectionInfo({
@@ -144,7 +162,15 @@ export default function EpubReader({ book }: { book: BookRecord }) {
         anchorRect,
         contentsDoc: contents.document,
         rangeSnapshot: range.cloneRange(),
+        overlayRects,
       })
+
+      // Clear the live selection inside the iframe so mobile's native
+      // Copy/Share/Select-all action bar (which can only attach to a live
+      // Selection) disappears — SelectionOverlay above stands in for it
+      // visually. triggerSelectedEvent only re-emits 'selected' for a
+      // non-collapsed range, so this doesn't loop back into this handler.
+      sel.removeAllRanges()
     })
 
     rendition.on('click', (event: MouseEvent, contents: Contents) => {
@@ -174,6 +200,13 @@ export default function EpubReader({ book }: { book: BookRecord }) {
 
       if (hasSelection) return
       setActivePopover(null)
+      // A plain tap while our custom selection toolbar is showing dismisses
+      // it. We clear the real iframe Selection as soon as it's captured
+      // (see the 'selected' handler above), so there's nothing left to
+      // naturally collapse on tap — this has to be explicit. hasSelection
+      // being false above already guarantees this isn't a click firing
+      // mid-gesture on a selection we haven't captured yet.
+      setSelectionInfo(null)
 
       if (flowRef.current === 'paginated') {
         const width = contents.window.innerWidth
@@ -500,7 +533,6 @@ export default function EpubReader({ book }: { book: BookRecord }) {
   async function handlePickColor(color: HighlightColor) {
     const info = selectionInfo
     setSelectionInfo(null)
-    info?.contentsDoc.defaultView?.getSelection()?.removeAllRanges()
     if (!info) return
     const zip = zipRef.current
     if (!zip) return
@@ -647,6 +679,8 @@ export default function EpubReader({ book }: { book: BookRecord }) {
         onNavigate={handleTocNavigate}
         onClose={() => setTocOpen(false)}
       />
+
+      {selectionInfo && <SelectionOverlay rects={selectionInfo.overlayRects} />}
 
       {selectionInfo && fileSyncStatus === 'needs-permission' && (
         <GrantAccessPrompt

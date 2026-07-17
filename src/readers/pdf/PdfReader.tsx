@@ -25,6 +25,10 @@ import {
 import { updateBookFile, updateBookProgress, type BookRecord } from '../../lib/storage'
 import GrantAccessPrompt from '../shared/GrantAccessPrompt'
 import HighlightPopover from '../shared/HighlightPopover'
+import SelectionOverlay, {
+  SELECTION_SETTLE_DELAY_MS,
+  type OverlayRect,
+} from '../shared/SelectionOverlay'
 import SelectionToolbar from '../shared/SelectionToolbar'
 import { clientRectToQuad } from './geometry'
 import HighlightsPanel from './HighlightsPanel'
@@ -97,6 +101,7 @@ interface SelectionInfo {
   pageIndex: number
   quads: Quad[]
   anchorRect: DOMRect
+  overlayRects: OverlayRect[]
 }
 
 interface PopoverInfo {
@@ -341,7 +346,21 @@ export default function PdfReader({ book }: { book: BookRecord }) {
     })
   }
 
+  // Detects a finished text selection and captures everything needed to
+  // render our own selection UI, then immediately clears the real browser
+  // Selection. On mobile, a live Selection makes the OS's native
+  // Copy/Share/Select-all action bar appear and visually collide with
+  // SelectionToolbar's color swatches — it can't be styled away, only
+  // removed, so we remove it and draw our own overlay in its place (see
+  // SelectionOverlay). selectionchange (rather than mouseup/keyup) is what
+  // reliably signals "settled" for both mouse drag-select and touch
+  // long-press + handle-drag select, so it's debounced rather than acted on
+  // immediately — the handles keep firing selectionchange as the user drags
+  // them, well after any mouseup/touchend.
   useEffect(() => {
+    let debounceTimer: number | undefined
+    let suppressNextChange = false
+
     function evaluateSelection() {
       const sel = window.getSelection()
       if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
@@ -363,22 +382,45 @@ export default function PdfReader({ book }: { book: BookRecord }) {
         return
       }
       const containerRect = pageEl.getBoundingClientRect()
-      const rects = Array.from(range.getClientRects())
-      const quads = rects
+      const clientRects = Array.from(range.getClientRects()).filter(
+        (r) => r.width > 0.5 && r.height > 0.5,
+      )
+      const quads = clientRects
         .map((r) => clientRectToQuad(r, containerRect, viewport))
         .filter((q) => q.width > 0.5 && q.height > 0.5)
       if (quads.length === 0) {
         setSelectionInfo(null)
         return
       }
-      setSelectionInfo({ pageIndex, quads, anchorRect: range.getBoundingClientRect() })
+      const anchorRect = range.getBoundingClientRect()
+      const overlayRects: OverlayRect[] = clientRects.map((r) => ({
+        left: r.left,
+        top: r.top,
+        width: r.width,
+        height: r.height,
+      }))
+
+      // Capture is done — clearing the selection fires another
+      // selectionchange event; the guard below ignores that one echo so it
+      // doesn't immediately wipe out the selectionInfo we're about to set.
+      suppressNextChange = true
+      sel.removeAllRanges()
+      setSelectionInfo({ pageIndex, quads, anchorRect, overlayRects })
     }
 
-    document.addEventListener('mouseup', evaluateSelection)
-    document.addEventListener('keyup', evaluateSelection)
+    function onSelectionChange() {
+      if (suppressNextChange) {
+        suppressNextChange = false
+        return
+      }
+      window.clearTimeout(debounceTimer)
+      debounceTimer = window.setTimeout(evaluateSelection, SELECTION_SETTLE_DELAY_MS)
+    }
+
+    document.addEventListener('selectionchange', onSelectionChange)
     return () => {
-      document.removeEventListener('mouseup', evaluateSelection)
-      document.removeEventListener('keyup', evaluateSelection)
+      document.removeEventListener('selectionchange', onSelectionChange)
+      window.clearTimeout(debounceTimer)
     }
   }, [])
 
@@ -454,7 +496,6 @@ export default function PdfReader({ book }: { book: BookRecord }) {
     const info = selectionInfo
     const doc = pdfLibDocRef.current
     setSelectionInfo(null)
-    window.getSelection()?.removeAllRanges()
     if (!info || !doc) return
 
     const canWriteToFile = await ensureWritePermissionForGesture()
@@ -562,6 +603,18 @@ export default function PdfReader({ book }: { book: BookRecord }) {
       <div
         ref={scrollRef}
         onScroll={handleScroll}
+        onClick={() => {
+          // A tap while our custom selection toolbar is showing dismisses
+          // it. Once a selection is captured we clear the real browser
+          // Selection (see the selectionchange effect above), so there's
+          // nothing left to naturally collapse on tap — this has to be
+          // explicit. Guarded on the *live* selection still being collapsed
+          // so a click firing as a side effect of the same gesture that
+          // just created a new selection doesn't wipe out a capture that
+          // hasn't happened yet.
+          const sel = window.getSelection()
+          if (selectionInfo && (!sel || sel.isCollapsed)) setSelectionInfo(null)
+        }}
         className="h-full overflow-y-auto px-4 pt-16 pb-8 sm:px-6"
       >
         {Array.from({ length: numPages }, (_, i) => (
@@ -579,6 +632,8 @@ export default function PdfReader({ book }: { book: BookRecord }) {
           />
         ))}
       </div>
+
+      {selectionInfo && <SelectionOverlay rects={selectionInfo.overlayRects} />}
 
       {selectionInfo && fileSyncStatus === 'needs-permission' && (
         <GrantAccessPrompt
