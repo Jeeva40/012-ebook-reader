@@ -8,10 +8,10 @@
       "port": 5173
     },
     {
-      "name": "api-server",
+      "name": "vite-preview",
       "runtimeExecutable": "npm",
-      "runtimeArgs": ["run", "server"],
-      "port": 3001
+      "runtimeArgs": ["run", "preview"],
+      "port": 4173
     }
   ]
 }
