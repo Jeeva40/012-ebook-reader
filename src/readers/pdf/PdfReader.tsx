@@ -25,11 +25,13 @@ import {
 import { updateBookFile, updateBookProgress, type BookRecord } from '../../lib/storage'
 import GrantAccessPrompt from '../shared/GrantAccessPrompt'
 import HighlightPopover from '../shared/HighlightPopover'
+import SelectionHandles from '../shared/SelectionHandles'
 import SelectionOverlay, {
   SELECTION_SETTLE_DELAY_MS,
   type OverlayRect,
 } from '../shared/SelectionOverlay'
 import SelectionToolbar from '../shared/SelectionToolbar'
+import { useTouchSelection } from '../shared/useTouchSelection'
 import { clientRectToQuad } from './geometry'
 import HighlightsPanel from './HighlightsPanel'
 import PdfPage from './PdfPage'
@@ -102,7 +104,16 @@ interface SelectionInfo {
   quads: Quad[]
   anchorRect: DOMRect
   overlayRects: OverlayRect[]
+  /** Only set for a touch-originated selection — desktop mouse selection
+   * has no drag handles, native cursor dragging already fills that role. */
+  handles?: { start: { x: number; y: number }; end: { x: number; y: number } }
 }
+
+function isWithinPage(target: EventTarget | null): boolean {
+  return target instanceof Element && Boolean(target.closest('[data-page-index]'))
+}
+
+const identityScreenPoint = (x: number, y: number) => ({ x, y })
 
 interface PopoverInfo {
   id: string
@@ -139,6 +150,51 @@ export default function PdfReader({ book }: { book: BookRecord }) {
   const tickingRef = useRef(false)
   const progressTimeoutRef = useRef<number>(undefined)
   const restoredRef = useRef(false)
+
+  const touchSelection = useTouchSelection<null>({ isSelectableTarget: isWithinPage })
+
+  // Binds the fully custom long-press + drag-handle touch selection (see
+  // useTouchSelection) to the scroll area. Its own internal logic already
+  // no-ops on anything but a coarse pointer, since (pointer: coarse) is also
+  // what gates native selection off in index.css — the two stay in sync off
+  // the same media feature rather than a prop threaded through here.
+  useEffect(() => {
+    const el = scrollRef.current
+    if (!el) return
+    return touchSelection.bindContainer(el, {
+      doc: document,
+      toScreenPoint: identityScreenPoint,
+      meta: null,
+    })
+  }, [touchSelection])
+
+  // Converts the touch-selection's plain Range into this reader's own
+  // SelectionInfo (same page/quad lookup the desktop flow below uses) —
+  // from here on, a touch-originated selection is indistinguishable from a
+  // desktop one to the rest of the component, aside from carrying handles.
+  useEffect(() => {
+    const ts = touchSelection.selection
+    if (!ts) return
+    const node = ts.range.commonAncestorContainer
+    const el = node.nodeType === Node.ELEMENT_NODE ? (node as Element) : node.parentElement
+    const pageEl = el?.closest<HTMLElement>('[data-page-index]')
+    if (!pageEl) return
+    const pageIndex = Number(pageEl.dataset.pageIndex)
+    const viewport = viewportsRef.current.get(pageIndex)
+    if (!viewport) return
+    const containerRect = pageEl.getBoundingClientRect()
+    const quads = ts.overlayRects
+      .map((r) => clientRectToQuad(new DOMRect(r.left, r.top, r.width, r.height), containerRect, viewport))
+      .filter((q) => q.width > 0.5 && q.height > 0.5)
+    if (quads.length === 0) return
+    setSelectionInfo({
+      pageIndex,
+      quads,
+      anchorRect: ts.anchorRect,
+      overlayRects: ts.overlayRects,
+      handles: { start: ts.startHandle, end: ts.endHandle },
+    })
+  }, [touchSelection.selection])
 
   useEffect(() => {
     let cancelled = false
@@ -362,6 +418,12 @@ export default function PdfReader({ book }: { book: BookRecord }) {
     let suppressNextChange = false
 
     function evaluateSelection() {
+      // Coarse pointers never get here in practice — index.css disables
+      // native selection there, so touch never produces a live Selection
+      // for this listener to see — but bail explicitly rather than rely on
+      // that alone, since this flow (unlike the touch one) shows no handles
+      // and would look broken if it ever did fire from a touch device.
+      if (window.matchMedia('(pointer: coarse)').matches) return
       const sel = window.getSelection()
       if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
         setSelectionInfo(null)
@@ -496,6 +558,7 @@ export default function PdfReader({ book }: { book: BookRecord }) {
     const info = selectionInfo
     const doc = pdfLibDocRef.current
     setSelectionInfo(null)
+    touchSelection.clear()
     if (!info || !doc) return
 
     const canWriteToFile = await ensureWritePermissionForGesture()
@@ -613,7 +676,10 @@ export default function PdfReader({ book }: { book: BookRecord }) {
           // just created a new selection doesn't wipe out a capture that
           // hasn't happened yet.
           const sel = window.getSelection()
-          if (selectionInfo && (!sel || sel.isCollapsed)) setSelectionInfo(null)
+          if (selectionInfo && (!sel || sel.isCollapsed)) {
+            setSelectionInfo(null)
+            touchSelection.clear()
+          }
         }}
         className="h-full overflow-y-auto px-4 pt-16 pb-8 sm:px-6"
       >
@@ -634,6 +700,15 @@ export default function PdfReader({ book }: { book: BookRecord }) {
       </div>
 
       {selectionInfo && <SelectionOverlay rects={selectionInfo.overlayRects} />}
+
+      {selectionInfo?.handles && (
+        <SelectionHandles
+          start={selectionInfo.handles.start}
+          end={selectionInfo.handles.end}
+          onStartTouchStart={touchSelection.startHandleTouchStart}
+          onEndTouchStart={touchSelection.endHandleTouchStart}
+        />
+      )}
 
       {selectionInfo && fileSyncStatus === 'needs-permission' && (
         <GrantAccessPrompt

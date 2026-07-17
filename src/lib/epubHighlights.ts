@@ -87,6 +87,34 @@ export function ensureHighlightStyleInjected(doc: Document): void {
   doc.head?.appendChild(style)
 }
 
+const TOUCH_SELECTION_STYLE_MARKER = '/* ebook-reader-touch-selection-disable */'
+
+/** Each chapter renders in its own iframe document with its own stylesheet
+ * cascade, entirely separate from the top-level app's index.css — so the
+ * same (pointer: coarse) native-selection-disabling rule applied there for
+ * the PDF text layer has to be injected here too, per chapter. `!important`
+ * guarantees this wins regardless of whatever the book's own author
+ * stylesheet declares (EPUB content can set anything, including
+ * user-select: text directly on elements). Idempotent for the same DTD
+ * reasons documented on ensureHighlightStyleInjected. */
+export function ensureTouchSelectionDisabled(doc: Document): void {
+  const existing = doc.querySelectorAll('style')
+  for (const s of existing) {
+    if (s.textContent?.includes(TOUCH_SELECTION_STYLE_MARKER)) return
+  }
+  const style = doc.createElement('style')
+  style.setAttribute('type', 'text/css')
+  style.textContent = `${TOUCH_SELECTION_STYLE_MARKER}
+@media (pointer: coarse) {
+  html, body, * {
+    user-select: none !important;
+    -webkit-user-select: none !important;
+    -webkit-touch-callout: none !important;
+  }
+}`
+  doc.head?.appendChild(style)
+}
+
 function snippetFor(text: string): string {
   const trimmed = text.replace(/\s+/g, ' ').trim()
   return trimmed.length > SNIPPET_MAX_LENGTH

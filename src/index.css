@@ -64,6 +64,24 @@
   background: rgba(38, 132, 255, 0.35);
 }
 
+/* Coarse pointers (touch) get a fully custom long-press + drag-handle
+   selection UI instead (see useTouchSelection) because reacting to the
+   native Selection *after* the OS has already decided to show its own
+   Copy/Share/Select-all action bar is too late — by the time our JS runs,
+   the bar has already been shown. The only way to prevent it is to make
+   sure a native Selection is never created via touch in the first place.
+   Scoped to (pointer: coarse) so mouse users on desktop keep ordinary
+   browser text selection, completely untouched. */
+@media (pointer: coarse) {
+  .textLayer,
+  .textLayer span,
+  .textLayer br {
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+  }
+}
+
 /* epub.js's continuous-scroll manager (.epub-container) does its own
    scroll-position compensation when sections above the viewport load or get
    trimmed — it measures the real, already-rendered bounds of each section

@@ -12,6 +12,7 @@ import {
   addHighlightToZip,
   createHighlightId,
   ensureMimetypeStored,
+  ensureTouchSelectionDisabled,
   healZipXhtml,
   readHighlightsFromZip,
   recolorHighlight,
@@ -24,8 +25,10 @@ import {
 import { updateBookFile, updateBookProgress, type BookRecord } from '../../lib/storage'
 import GrantAccessPrompt from '../shared/GrantAccessPrompt'
 import HighlightPopover from '../shared/HighlightPopover'
+import SelectionHandles from '../shared/SelectionHandles'
 import SelectionOverlay, { type OverlayRect } from '../shared/SelectionOverlay'
 import SelectionToolbar from '../shared/SelectionToolbar'
+import { useTouchSelection } from '../shared/useTouchSelection'
 import EpubHighlightsPanel from './EpubHighlightsPanel'
 import EpubReaderToolbar from './EpubReaderToolbar'
 import TocSidebar, { type TocNavItem } from './TocSidebar'
@@ -49,7 +52,12 @@ interface SelectionInfo {
   contentsDoc: Document
   rangeSnapshot: Range
   overlayRects: OverlayRect[]
+  /** Only set for a touch-originated selection — desktop mouse selection
+   * has no drag handles, native cursor dragging already fills that role. */
+  handles?: { start: { x: number; y: number }; end: { x: number; y: number } }
 }
+
+const alwaysSelectable = () => true
 
 interface PopoverInfo {
   id: string
@@ -113,18 +121,44 @@ export default function EpubReader({ book }: { book: BookRecord }) {
   // fully resolves before the next write starts.
   const writeQueueRef = useRef<Promise<void>>(Promise.resolve())
 
+  const touchSelection = useTouchSelection<Contents>({ isSelectableTarget: alwaysSelectable })
+
   function wireRenditionEvents(rendition: Rendition, epubBook: Book) {
     rendition.themes.default({
       body: { 'line-height': '1.6 !important', padding: '0 4px !important' },
       p: { margin: '0 0 1em 0' },
     })
 
+    // Each chapter renders in its own iframe, and touch events inside an
+    // iframe never reach listeners outside it — so the custom touch
+    // selection (see useTouchSelection) has to be bound fresh to every
+    // chapter's own document as it's rendered, same as the touch-selection-
+    // disabling CSS below it.
+    rendition.on('rendered', (_section: unknown, view: { contents?: Contents }) => {
+      const contents = view.contents
+      if (!contents?.document) return
+      ensureTouchSelectionDisabled(contents.document)
+      touchSelection.bindContainer(contents.document, {
+        doc: contents.document,
+        toScreenPoint: (x, y) => {
+          const iframe = contents.window.frameElement as HTMLIFrameElement | null
+          const r = iframe?.getBoundingClientRect()
+          return { x: x + (r?.left ?? 0), y: y + (r?.top ?? 0) }
+        },
+        meta: contents,
+      })
+    })
+
     // epub.js's own Contents class already debounces this event on
     // selectionchange (250ms, see onSelectionChange/triggerSelectedEvent in
     // node_modules/epubjs/src/contents.js) and only fires it for a
     // non-collapsed range, so no extra debounce is needed here — we can
-    // capture and clear the selection directly once it arrives.
+    // capture and clear the selection directly once it arrives. Coarse
+    // pointers never get here in practice — the injected CSS above disables
+    // native selection there — but bail explicitly anyway, since this flow
+    // shows no handles and would look broken if it ever did fire from touch.
     rendition.on('selected', (cfiRange: string, contents: Contents) => {
+      if (window.matchMedia('(pointer: coarse)').matches) return
       const sel = contents.window.getSelection()
       if (!sel || sel.isCollapsed || sel.rangeCount === 0) return
       const range = sel.getRangeAt(0)
@@ -207,6 +241,7 @@ export default function EpubReader({ book }: { book: BookRecord }) {
       // being false above already guarantees this isn't a click firing
       // mid-gesture on a selection we haven't captured yet.
       setSelectionInfo(null)
+      touchSelection.clear()
 
       if (flowRef.current === 'paginated') {
         const width = contents.window.innerWidth
@@ -442,6 +477,33 @@ export default function EpubReader({ book }: { book: BookRecord }) {
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [tocOpen, highlightsPanelOpen])
 
+  // Converts the touch-selection's plain Range into this reader's own
+  // SelectionInfo, using the same Contents instance (stashed as `meta` by
+  // the 'rendered' handler above) epub.js's own 'selected' event would have
+  // handed us — from here on, a touch-originated selection is
+  // indistinguishable from a desktop one to the rest of the component,
+  // aside from carrying handles.
+  useEffect(() => {
+    const ts = touchSelection.selection
+    if (!ts) return
+    const contents = ts.meta
+    const epubBook = bookRef.current
+    if (!contents || !epubBook) return
+    const section = epubBook.spine.get(contents.sectionIndex)
+    const href = hrefForSection(section)
+    const cfiRange = contents.cfiFromRange(ts.range)
+    setActivePopover(null)
+    setSelectionInfo({
+      cfiRange,
+      href,
+      anchorRect: ts.anchorRect,
+      contentsDoc: contents.document,
+      rangeSnapshot: ts.range.cloneRange(),
+      overlayRects: ts.overlayRects,
+      handles: { start: ts.startHandle, end: ts.endHandle },
+    })
+  }, [touchSelection.selection])
+
   useEffect(() => {
     let cancelled = false
     async function checkPermission() {
@@ -533,6 +595,7 @@ export default function EpubReader({ book }: { book: BookRecord }) {
   async function handlePickColor(color: HighlightColor) {
     const info = selectionInfo
     setSelectionInfo(null)
+    touchSelection.clear()
     if (!info) return
     const zip = zipRef.current
     if (!zip) return
@@ -681,6 +744,15 @@ export default function EpubReader({ book }: { book: BookRecord }) {
       />
 
       {selectionInfo && <SelectionOverlay rects={selectionInfo.overlayRects} />}
+
+      {selectionInfo?.handles && (
+        <SelectionHandles
+          start={selectionInfo.handles.start}
+          end={selectionInfo.handles.end}
+          onStartTouchStart={touchSelection.startHandleTouchStart}
+          onEndTouchStart={touchSelection.endHandleTouchStart}
+        />
+      )}
 
       {selectionInfo && fileSyncStatus === 'needs-permission' && (
         <GrantAccessPrompt
