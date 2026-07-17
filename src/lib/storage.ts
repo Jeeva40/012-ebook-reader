@@ -115,3 +115,19 @@ export async function updateBookFile(
   if (!record) return
   await db.put('books', { ...record, file, highlightCount })
 }
+
+/** Repairs a book record whose fileHandle is missing/stale (e.g. a record
+ * saved before the File System Access refactor) by attaching a freshly
+ * re-picked handle. Returns the updated record so callers can render the
+ * reader immediately instead of re-fetching. */
+export async function updateBookFileHandle(
+  id: string,
+  fileHandle: FileSystemFileHandle,
+): Promise<BookRecord | undefined> {
+  const db = await getDB()
+  const record = await db.get('books', id)
+  if (!record) return undefined
+  const updated: BookRecord = { ...record, fileHandle }
+  await db.put('books', updated)
+  return updated
+}

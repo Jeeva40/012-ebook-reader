@@ -35,8 +35,58 @@ import ReaderToolbar from './ReaderToolbar'
 const MIN_SCALE = 0.5
 const MAX_SCALE = 3
 const ZOOM_STEP = 0.25
-const RENDER_MARGIN = '600px 0px 600px 0px'
 const EMPTY_HIGHLIGHTS: Highlight[] = []
+const MEASURE_BATCH_SIZE = 24
+// How far outside the viewport a page starts rendering, as a multiple of
+// viewport height. Needs to comfortably exceed how far a page can scroll in
+// the time it takes pdf.js to render one (including touch-momentum flicks,
+// which cover much more distance per frame than mouse-wheel scrolling) —
+// otherwise a page enters view mid-render and the user sees it blank.
+const RENDER_MARGIN_VH_MULTIPLIER = 1.5
+
+function computeRenderMargin(): string {
+  const vh = typeof window !== 'undefined' ? window.innerHeight : 800
+  const margin = Math.round(vh * RENDER_MARGIN_VH_MULTIPLIER)
+  return `${margin}px 0px ${margin}px 0px`
+}
+
+/**
+ * Every page's exact (unscaled) size, fetched up front. pdf.js can report a
+ * page's viewport straight from its /MediaBox without decoding or rendering
+ * it, so this is cheap even for large PDFs — and it means placeholders can
+ * reserve each page's *real* final height from their very first paint,
+ * instead of guessing (e.g. assuming every page matches page 1, which is
+ * wrong for any PDF with mixed page sizes and was the root cause of pages
+ * mounting and shifting everything below them). Batches with a yield in
+ * between so measuring a huge PDF doesn't block the main thread.
+ */
+async function measurePageSizes(
+  pdf: PDFDocumentProxy,
+  isCancelled: () => boolean,
+): Promise<PageSize[]> {
+  const sizes: PageSize[] = new Array(pdf.numPages)
+  for (let start = 0; start < pdf.numPages; start += MEASURE_BATCH_SIZE) {
+    if (isCancelled()) return sizes
+    const end = Math.min(start + MEASURE_BATCH_SIZE, pdf.numPages)
+    // allSettled, not all: one corrupted page dictionary shouldn't take the
+    // whole book down with it. sizeFor() already falls back to basePageSize
+    // for any index this leaves empty.
+    const results = await Promise.allSettled(
+      Array.from({ length: end - start }, (_, i) => pdf.getPage(start + i + 1)),
+    )
+    for (let i = 0; i < results.length; i++) {
+      const result = results[i]
+      if (result.status === 'fulfilled') {
+        const vp = result.value.getViewport({ scale: 1 })
+        sizes[start + i] = { width: vp.width, height: vp.height }
+      } else {
+        console.error(`Failed to measure PDF page ${start + i + 1}`, result.reason)
+      }
+    }
+    if (end < pdf.numPages) await new Promise((resolve) => setTimeout(resolve, 0))
+  }
+  return sizes
+}
 
 interface PageSize {
   width: number
@@ -59,7 +109,7 @@ export default function PdfReader({ book }: { book: BookRecord }) {
   const [pdfDoc, setPdfDoc] = useState<PDFDocumentProxy | null>(null)
   const [numPages, setNumPages] = useState(0)
   const [basePageSize, setBasePageSize] = useState<PageSize | null>(null)
-  const [sizeOverrides, setSizeOverrides] = useState<Map<number, PageSize>>(new Map())
+  const [pageSizes, setPageSizes] = useState<PageSize[] | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   const [scale, setScale] = useState(1.25)
@@ -72,6 +122,7 @@ export default function PdfReader({ book }: { book: BookRecord }) {
   const [currentPage, setCurrentPage] = useState(1)
   const [visiblePages, setVisiblePages] = useState<Set<number>>(() => new Set([0]))
   const [fileSyncStatus, setFileSyncStatus] = useState<FileSyncStatus>(null)
+  const [renderMargin, setRenderMargin] = useState(computeRenderMargin)
 
   const pdfLibDocRef = useRef<PDFDocument | null>(null)
   const loadingTaskRef = useRef<PDFDocumentLoadingTask | null>(null)
@@ -109,7 +160,11 @@ export default function PdfReader({ book }: { book: BookRecord }) {
 
         const firstPage = await pdf.getPage(1)
         const vp = firstPage.getViewport({ scale: 1 })
-        if (!cancelled) setBasePageSize({ width: vp.width, height: vp.height })
+        if (cancelled) return
+        setBasePageSize({ width: vp.width, height: vp.height })
+
+        const sizes = await measurePageSizes(pdf, () => cancelled)
+        if (!cancelled) setPageSizes(sizes)
       } catch (err) {
         if (!cancelled) {
           setError(err instanceof Error ? err.message : 'Failed to load PDF')
@@ -136,6 +191,21 @@ export default function PdfReader({ book }: { book: BookRecord }) {
       cancelled = true
     }
   }, [book.fileHandle])
+
+  // Viewport height drives the render margin (see computeRenderMargin), so
+  // keep it current across resizes and orientation changes rather than
+  // freezing whatever it was when the reader first mounted.
+  useEffect(() => {
+    function onResize() {
+      setRenderMargin(computeRenderMargin())
+    }
+    window.addEventListener('resize', onResize)
+    window.addEventListener('orientationchange', onResize)
+    return () => {
+      window.removeEventListener('resize', onResize)
+      window.removeEventListener('orientationchange', onResize)
+    }
+  }, [])
 
   async function handleGrantFileAccess() {
     try {
@@ -183,7 +253,7 @@ export default function PdfReader({ book }: { book: BookRecord }) {
           return changed ? next : prev
         })
       },
-      { root, rootMargin: RENDER_MARGIN },
+      { root, rootMargin: renderMargin },
     )
     observerRef.current = observer
     for (const el of wrapperElsRef.current.values()) observer.observe(el)
@@ -194,8 +264,10 @@ export default function PdfReader({ book }: { book: BookRecord }) {
     }
     // scrollRef only becomes non-null once basePageSize is also set (that's
     // what gates rendering the scroll container instead of the loading
-    // state), so this must re-run when either becomes available.
-  }, [numPages, basePageSize])
+    // state), so this must re-run when either becomes available. Also
+    // re-runs when the render margin changes (viewport resize/rotation) so
+    // the buffer stays proportional to the current screen height.
+  }, [numPages, basePageSize, renderMargin])
 
   useEffect(() => {
     if (restoredRef.current) return
@@ -209,29 +281,16 @@ export default function PdfReader({ book }: { book: BookRecord }) {
     }
   }, [basePageSize, numPages, book.lastReadPosition])
 
-  const handleMeasured = useCallback((pageIndex: number, size: PageSize) => {
-    setSizeOverrides((prev) => {
-      const existing = prev.get(pageIndex)
-      if (
-        existing &&
-        Math.abs(existing.width - size.width) < 0.5 &&
-        Math.abs(existing.height - size.height) < 0.5
-      ) {
-        return prev
-      }
-      const next = new Map(prev)
-      next.set(pageIndex, size)
-      return next
-    })
-  }, [])
-
   const handleViewportReady = useCallback((pageIndex: number, viewport: PageViewport | null) => {
     if (viewport) viewportsRef.current.set(pageIndex, viewport)
     else viewportsRef.current.delete(pageIndex)
   }, [])
 
+  // pageSizes is fully populated before the reader ever renders (see the
+  // load effect and the loading gate below), so every placeholder gets its
+  // exact final size from the start — never an estimate that later changes.
   function sizeFor(pageIndex: number): PageSize {
-    return sizeOverrides.get(pageIndex) ?? basePageSize ?? { width: 600, height: 800 }
+    return pageSizes?.[pageIndex] ?? basePageSize ?? { width: 600, height: 800 }
   }
 
   function computeCurrentPage(): number {
@@ -476,7 +535,7 @@ export default function PdfReader({ book }: { book: BookRecord }) {
     )
   }
 
-  if (!pdfDoc || !basePageSize) {
+  if (!pdfDoc || !basePageSize || !pageSizes) {
     return (
       <div className="flex h-[calc(100dvh-56px)] items-center justify-center bg-gray-50">
         <p className="text-sm text-gray-400">Loading…</p>
@@ -515,7 +574,6 @@ export default function PdfReader({ book }: { book: BookRecord }) {
             isActive={visiblePages.has(i)}
             highlights={highlightsByPage.get(i) ?? EMPTY_HIGHLIGHTS}
             registerWrapper={registerWrapper}
-            onMeasured={handleMeasured}
             onViewportReady={handleViewportReady}
             onHighlightClick={(id, x, y) => setActivePopover({ id, x, y })}
           />

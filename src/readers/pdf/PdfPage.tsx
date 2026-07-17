@@ -17,7 +17,6 @@ interface PdfPageProps {
   isActive: boolean
   highlights: Highlight[]
   registerWrapper: (pageIndex: number, el: HTMLDivElement | null) => void
-  onMeasured: (pageIndex: number, size: { width: number; height: number }) => void
   onViewportReady: (pageIndex: number, viewport: PageViewport | null) => void
   onHighlightClick: (id: string, clientX: number, clientY: number) => void
 }
@@ -30,7 +29,6 @@ export default function PdfPage({
   isActive,
   highlights,
   registerWrapper,
-  onMeasured,
   onViewportReady,
   onHighlightClick,
 }: PdfPageProps) {
@@ -46,6 +44,21 @@ export default function PdfPage({
     },
     [pageIndex, registerWrapper],
   )
+
+  // size comes from PdfReader's upfront, exact per-page measurement (see
+  // measurePageSizes), not a guess — so these are the page's true final
+  // dimensions at this scale, known synchronously from props alone. Deriving
+  // the canvas's pixel-buffer size from them (rather than waiting on the
+  // async page.getViewport() call below) lets the canvas be born at its
+  // correct size in the same paint as the wrapper, instead of flashing
+  // through a default/0-sized buffer until the render effect catches up.
+  const width = size.width * scale
+  const height = size.height * scale
+  const outputScale = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1
+  const canvasCssWidth = Math.floor(width)
+  const canvasCssHeight = Math.floor(height)
+  const canvasPixelWidth = Math.floor(width * outputScale)
+  const canvasPixelHeight = Math.floor(height * outputScale)
 
   useEffect(() => {
     if (!isActive) {
@@ -65,18 +78,12 @@ export default function PdfPage({
       const pageViewport = page.getViewport({ scale })
       setViewport(pageViewport)
       onViewportReady(pageIndex, pageViewport)
-      onMeasured(pageIndex, {
-        width: pageViewport.width / scale,
-        height: pageViewport.height / scale,
-      })
 
+      // Canvas width/height (the pixel buffer) are already set via JSX from
+      // the exact upfront-measured size, so nothing to size here — just
+      // paint.
       const canvas = canvasRef.current
       if (!canvas) return
-      const outputScale = window.devicePixelRatio || 1
-      canvas.width = Math.floor(pageViewport.width * outputScale)
-      canvas.height = Math.floor(pageViewport.height * outputScale)
-      canvas.style.width = `${Math.floor(pageViewport.width)}px`
-      canvas.style.height = `${Math.floor(pageViewport.height)}px`
       const ctx = canvas.getContext('2d')
       if (!ctx) return
 
@@ -117,7 +124,7 @@ export default function PdfPage({
       renderTask?.cancel()
       textLayer?.cancel()
     }
-  }, [isActive, pdfDoc, pageIndex, scale, onMeasured, onViewportReady])
+  }, [isActive, pdfDoc, pageIndex, scale, outputScale, onViewportReady])
 
   function handleClick(e: React.MouseEvent) {
     const selection = window.getSelection()
@@ -138,9 +145,6 @@ export default function PdfPage({
     }
   }
 
-  const width = size.width * scale
-  const height = size.height * scale
-
   return (
     <div
       ref={setWrapperRef}
@@ -151,7 +155,13 @@ export default function PdfPage({
     >
       {isActive ? (
         <>
-          <canvas ref={canvasRef} className="block" />
+          <canvas
+            ref={canvasRef}
+            width={canvasPixelWidth}
+            height={canvasPixelHeight}
+            style={{ width: canvasCssWidth, height: canvasCssHeight }}
+            className="block"
+          />
           {viewport && (
             <div
               className="pointer-events-none absolute inset-0"

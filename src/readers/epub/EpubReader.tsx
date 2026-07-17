@@ -32,6 +32,15 @@ import TocSidebar, { type TocNavItem } from './TocSidebar'
 const SWIPE_THRESHOLD = 40
 const EDGE_ZONE = 0.15
 
+/** epubjs's bundled .d.ts only declares the options its DefaultViewManager
+ * understands; ContinuousViewManager accepts a couple more (offset,
+ * offsetDelta) that it merges straight into its own settings at runtime
+ * (see its constructor) but that aren't part of the typed RenditionOptions. */
+type EpubRenderOptions = NonNullable<Parameters<Book['renderTo']>[1]> & {
+  offset?: number
+  offsetDelta?: number
+}
+
 interface SelectionInfo {
   cfiRange: string
   href: string
@@ -236,14 +245,34 @@ export default function EpubReader({ book }: { book: BookRecord }) {
 
     renditionRef.current?.destroy()
 
-    const rendition = epubBook.renderTo(viewerRef.current, {
+    // How far past the visible viewport the continuous manager keeps
+    // sections loaded — its analogue of PdfReader's IntersectionObserver
+    // render margin. epub.js's own default (500px) is comfortably less than
+    // one screen on most devices, so a fast scroll — especially a
+    // touch-momentum flick, which covers far more distance per frame than
+    // mouse-wheel scrolling — can outrun it, catching a section's iframe
+    // before it's finished loading and settling. That's the moment the
+    // visible "jump, then snap back" happens: epub.js's own scroll
+    // compensation (ContinuousViewManager's counter()/erase()) is exact,
+    // not an estimate, but it can only compensate for a resize *after* it's
+    // already visible on screen. Giving it more runway means that happens
+    // off-screen instead. Only meaningful for the continuous manager;
+    // harmless (unused) for 'default'.
+    const scrollBuffer = Math.round(
+      (typeof window !== 'undefined' ? window.innerHeight : 800) * 1.5,
+    )
+    const renderOptions: EpubRenderOptions = {
       width: '100%',
       height: '100%',
       flow: mode === 'paginated' ? 'paginated' : 'scrolled',
       manager: mode === 'paginated' ? 'default' : 'continuous',
       spread: 'none',
       allowScriptedContent: false,
-    })
+      offset: scrollBuffer,
+      offsetDelta: Math.round(scrollBuffer / 2),
+    }
+
+    const rendition = epubBook.renderTo(viewerRef.current, renderOptions)
     renditionRef.current = rendition
     wireRenditionEvents(rendition, epubBook)
     return rendition

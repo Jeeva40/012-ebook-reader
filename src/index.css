@@ -63,3 +63,19 @@
 .textLayer ::selection {
   background: rgba(38, 132, 255, 0.35);
 }
+
+/* epub.js's continuous-scroll manager (.epub-container) does its own
+   scroll-position compensation when sections above the viewport load or get
+   trimmed — it measures the real, already-rendered bounds of each section
+   and adjusts scrollTop by that exact delta (see ContinuousViewManager's
+   counter()/erase() in node_modules/epubjs/src/managers/continuous). The
+   browser's native scroll-anchoring heuristic tries to do the same job from
+   the same trigger (a size change above the viewport), and the two can
+   double-compensate — a visible jump one way, followed by epub.js's own
+   correction snapping it back. Since epub.js's adjustment is already exact
+   (not an estimate), the native heuristic is redundant here and only adds
+   the chance of overshoot, so it's turned off for this one container rather
+   than site-wide. */
+.epub-container {
+  overflow-anchor: none;
+}
