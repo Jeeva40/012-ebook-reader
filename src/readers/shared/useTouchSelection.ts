@@ -307,6 +307,43 @@ export function useTouchSelection<TMeta>({ isSelectableTarget }: UseTouchSelecti
     }
   }, [applyRange])
 
+  // The overlay and handles are rendered with position: fixed (they live
+  // outside any scrolling ancestor — the highlight has to be drawn on top
+  // of everything, including reader chrome), so unlike position: absolute
+  // inside a scrolling container, the browser never repositions them on its
+  // own when the page scrolls. Without this, both the overlay and the
+  // handles stay glued to their initial screen position while the actual
+  // text scrolls out from under them — and a handle grabbed from that now
+  // wrong position computes drag coordinates relative to the wrong anchor,
+  // so a drag stops tracking the finger correctly (or worse, jumps the
+  // selection to unrelated text). Recomputing straight from the live Range
+  // fixes both: Range.getClientRects() always reflects the current
+  // scrolled layout, no matter which container scrolled or how.
+  useEffect(() => {
+    let scheduled = false
+    function onScroll() {
+      if (scheduled) return
+      scheduled = true
+      requestAnimationFrame(() => {
+        scheduled = false
+        const range = rangeRef.current
+        const target = activeTargetRef.current
+        if (!range || !target) return
+        const state = computeState(range, target)
+        if (!state) return
+        lastHitAnchorsRef.current = { start: state.startHitAnchor, end: state.endHitAnchor }
+        setSelection(state)
+      })
+    }
+    // capture: true so this catches scroll on *any* scrollable descendant
+    // in the document (scroll events don't bubble, but capture-phase
+    // listeners on an ancestor still see them) — covers the PDF reader's
+    // own scroll container and epub.js's internally-managed one without
+    // needing each reader to wire this up itself.
+    document.addEventListener('scroll', onScroll, { capture: true, passive: true })
+    return () => document.removeEventListener('scroll', onScroll, true)
+  }, [])
+
   // Plain functions (not React props) meant to be wired up via a raw
   // addEventListener({ passive: false }) on the rendered handle elements —
   // React registers its own onTouchStart/onTouchMove props as passive for
