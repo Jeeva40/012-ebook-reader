@@ -15,6 +15,12 @@ const MOVE_CANCEL_PX = 10
 export interface SelectionTarget<TMeta> {
   doc: Document
   toScreenPoint: (x: number, y: number) => { x: number; y: number }
+  /** Inverse of toScreenPoint — maps a top-level screen point back into
+   * this target's own document coordinate space. Needed because handle
+   * drags are tracked entirely in screen space (see DragState.grabOffset)
+   * but getCaretRangeFromPoint needs coordinates in the target document's
+   * own space (iframe-relative for EPUB). Identity for PDF. */
+  toDocPoint: (x: number, y: number) => { x: number; y: number }
   meta: TMeta
 }
 
@@ -23,8 +29,18 @@ export interface TouchSelectionState<TMeta> {
   meta: TMeta
   overlayRects: OverlayRect[]
   anchorRect: DOMRect
+  /** Where to draw the handle's teardrop — the bottom corner of its
+   * boundary rect, matching native mobile handle style. */
   startHandle: { x: number; y: number }
   endHandle: { x: number; y: number }
+  /** Where to *test* for that handle's drag, in getCaretRangeFromPoint
+   * terms — the vertical *center* of its boundary rect, not the bottom
+   * edge. The bottom edge is exactly where the rect's hit-testable area
+   * ends, so a point computed as "exactly at the bottom" can round or drift
+   * a fraction of a pixel outside the text and resolve to an ancestor
+   * element instead (see grabOffset's doc comment for how this gets used). */
+  startHitAnchor: { x: number; y: number }
+  endHitAnchor: { x: number; y: number }
 }
 
 interface UseTouchSelectionOptions {
@@ -46,6 +62,19 @@ type DragHandle = 'start' | 'end'
 interface DragState<TMeta> {
   which: DragHandle
   target: SelectionTarget<TMeta>
+  /** Screen-space offset between where the finger actually touched down
+   * and the handle's *hit-test* anchor (TouchSelectionState.startHitAnchor/
+   * endHitAnchor — the vertical center of the boundary rect, not the
+   * handle's visual bottom-edge position). The handle's touch target sits
+   * well below the text line it anchors to (stem + generous hit padding —
+   * see SelectionHandles) and the visual anchor is right at the text's
+   * bottom edge, so without this correction every subsequent touchmove's
+   * raw coordinates land at or below the text and can resolve to the
+   * page/section wrapper instead of the actual text, breaking range
+   * placement. Applied on every move so dragging tracks the finger
+   * consistently regardless of exactly where within the handle it
+   * grabbed. */
+  grabOffset: { x: number; y: number }
 }
 
 function computeState<TMeta>(
@@ -68,8 +97,19 @@ function computeState<TMeta>(
   const last = rawRects[rawRects.length - 1]
   const startHandle = target.toScreenPoint(first.left, first.bottom)
   const endHandle = target.toScreenPoint(last.right, last.bottom)
+  const startHitAnchor = target.toScreenPoint(first.left, (first.top + first.bottom) / 2)
+  const endHitAnchor = target.toScreenPoint(last.right, (last.top + last.bottom) / 2)
 
-  return { range, meta: target.meta, overlayRects, anchorRect, startHandle, endHandle }
+  return {
+    range,
+    meta: target.meta,
+    overlayRects,
+    anchorRect,
+    startHandle,
+    endHandle,
+    startHitAnchor,
+    endHitAnchor,
+  }
 }
 
 /**
@@ -94,6 +134,14 @@ export function useTouchSelection<TMeta>({ isSelectableTarget }: UseTouchSelecti
   const longPressTimerRef = useRef<number | undefined>(undefined)
   const rangeRef = useRef<Range | null>(null)
   const activeTargetRef = useRef<SelectionTarget<TMeta> | null>(null)
+  // Latest screen-space *hit-test* anchors (vertical center of each
+  // boundary rect, not the handle's visual bottom-edge position — see
+  // TouchSelectionState.startHitAnchor), kept alongside activeTargetRef
+  // purely so a fresh handle-grab can compute its offset from them (see
+  // DragState.grabOffset).
+  const lastHitAnchorsRef = useRef<{ start: { x: number; y: number }; end: { x: number; y: number } } | null>(
+    null,
+  )
   const draggingRef = useRef<DragState<TMeta> | null>(null)
 
   const clear = useCallback(() => {
@@ -101,6 +149,7 @@ export function useTouchSelection<TMeta>({ isSelectableTarget }: UseTouchSelecti
     gestureRef.current = null
     rangeRef.current = null
     activeTargetRef.current = null
+    lastHitAnchorsRef.current = null
     draggingRef.current = null
     setSelection(null)
   }, [])
@@ -110,6 +159,7 @@ export function useTouchSelection<TMeta>({ isSelectableTarget }: UseTouchSelecti
     if (!state) return
     rangeRef.current = range
     activeTargetRef.current = target
+    lastHitAnchorsRef.current = { start: state.startHitAnchor, end: state.endHitAnchor }
     setSelection(state)
   }, [])
 
@@ -188,7 +238,16 @@ export function useTouchSelection<TMeta>({ isSelectableTarget }: UseTouchSelecti
       if (!touch) return
       e.preventDefault()
 
-      const pointRange = getCaretRangeFromPoint(d.target.doc, touch.clientX, touch.clientY)
+      // Correct for where within the handle's (much larger than the text
+      // line) touch target the finger actually is — see grabOffset's doc
+      // comment. Without this, dragging tracks a point well below the
+      // text and can miss it (and any text-node comparisons built from
+      // that miss) entirely.
+      const screenX = touch.clientX - d.grabOffset.x
+      const screenY = touch.clientY - d.grabOffset.y
+      const docPoint = d.target.toDocPoint(screenX, screenY)
+
+      const pointRange = getCaretRangeFromPoint(d.target.doc, docPoint.x, docPoint.y)
       if (!pointRange) return
       const doc = d.target.doc
       const newRange = doc.createRange()
@@ -255,17 +314,29 @@ export function useTouchSelection<TMeta>({ isSelectableTarget }: UseTouchSelecti
   // and let the browser synthesize a stray click right after the drag
   // starts (see SelectionHandles).
   const startHandleTouchStart = useCallback((e: TouchEvent) => {
-    if (e.touches.length !== 1 || !activeTargetRef.current) return
+    if (e.touches.length !== 1 || !activeTargetRef.current || !lastHitAnchorsRef.current) return
     e.stopPropagation()
     e.preventDefault()
-    draggingRef.current = { which: 'start', target: activeTargetRef.current }
+    const touch = e.touches[0]
+    const anchor = lastHitAnchorsRef.current.start
+    draggingRef.current = {
+      which: 'start',
+      target: activeTargetRef.current,
+      grabOffset: { x: touch.clientX - anchor.x, y: touch.clientY - anchor.y },
+    }
   }, [])
 
   const endHandleTouchStart = useCallback((e: TouchEvent) => {
-    if (e.touches.length !== 1 || !activeTargetRef.current) return
+    if (e.touches.length !== 1 || !activeTargetRef.current || !lastHitAnchorsRef.current) return
     e.stopPropagation()
     e.preventDefault()
-    draggingRef.current = { which: 'end', target: activeTargetRef.current }
+    const touch = e.touches[0]
+    const anchor = lastHitAnchorsRef.current.end
+    draggingRef.current = {
+      which: 'end',
+      target: activeTargetRef.current,
+      grabOffset: { x: touch.clientX - anchor.x, y: touch.clientY - anchor.y },
+    }
   }, [])
 
   return {

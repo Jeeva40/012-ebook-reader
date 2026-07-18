@@ -20,16 +20,29 @@ export function expandRangeToWord(range: Range): void {
 
   if (typeof Intl !== 'undefined' && typeof Intl.Segmenter === 'function') {
     const segmenter = new Intl.Segmenter(undefined, { granularity: 'word' })
-    for (const seg of segmenter.segment(text)) {
+    const segments = Array.from(segmenter.segment(text))
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i]
       const segStart = seg.index
       const segEnd = seg.index + seg.segment.length
-      if (offset >= segStart && offset < segEnd) {
-        if (seg.isWordLike) {
-          range.setStart(container, segStart)
-          range.setEnd(container, segEnd)
-        }
+      if (offset < segStart || offset >= segEnd) continue
+      if (seg.isWordLike) {
+        range.setStart(container, segStart)
+        range.setEnd(container, segEnd)
         return
       }
+      // Landed exactly on a non-word segment (whitespace/punctuation) at
+      // its very start — that's the same boundary as "end of the previous
+      // word" (e.g. long-pressing right at a word's trailing edge, a very
+      // easy spot to land on and not meaningfully different from pressing
+      // the word itself). Prefer that word if there is one, rather than
+      // leaving the range collapsed.
+      if (offset === segStart && i > 0 && segments[i - 1].isWordLike) {
+        const prev = segments[i - 1]
+        range.setStart(container, prev.index)
+        range.setEnd(container, prev.index + prev.segment.length)
+      }
+      return
     }
     return
   }

@@ -145,6 +145,11 @@ export default function EpubReader({ book }: { book: BookRecord }) {
           const r = iframe?.getBoundingClientRect()
           return { x: x + (r?.left ?? 0), y: y + (r?.top ?? 0) }
         },
+        toDocPoint: (x, y) => {
+          const iframe = contents.window.frameElement as HTMLIFrameElement | null
+          const r = iframe?.getBoundingClientRect()
+          return { x: x - (r?.left ?? 0), y: y - (r?.top ?? 0) }
+        },
         meta: contents,
       })
     })

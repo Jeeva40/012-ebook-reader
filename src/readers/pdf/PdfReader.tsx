@@ -164,6 +164,7 @@ export default function PdfReader({ book }: { book: BookRecord }) {
     return touchSelection.bindContainer(el, {
       doc: document,
       toScreenPoint: identityScreenPoint,
+      toDocPoint: identityScreenPoint,
       meta: null,
     })
   }, [touchSelection])
